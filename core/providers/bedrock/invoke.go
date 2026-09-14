@@ -1014,14 +1014,23 @@ func (r *BedrockInvokeRequest) convertAnthropicTools() *BedrockToolConfig {
 			continue
 		}
 
-		// tool_search_tool_* is a server tool for Anthropic's tool-search-tool beta,
-		// not an invocable function. This ingress converts an InvokeModel-shaped
-		// request into the Converse-shaped internal request, which has no slot
-		// for it; the egress side routes tool search to InvokeModel only when the
-		// neutral request carries the tool (bedrock.go, InvokeModel section).
-		// Skip it here rather than building a broken, schema-less "function"
-		// tool out of it.
+		// tool_search_tool_* is a server tool, not an invocable function, and
+		// Converse has no slot for it: "On Amazon Bedrock, server-side tool search
+		// is available only through the InvokeModel API, not the Converse API."
+		// (https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-search-tool)
+		//
+		// Carry it on an ingress-only marker rather than dropping it. The egress
+		// predicate (responsesUsesAnthropicInvokePath) decides InvokeModel vs
+		// Converse from the neutral request, and this conversion is what builds
+		// that request — so dropping the tool here left the predicate blind and the
+		// feature silently no-op on this ingress (#7155). Building an invocable,
+		// schema-less "function" tool out of it would be wrong too.
 		if typeStr, ok := toolMap["type"].(string); ok && strings.HasPrefix(typeStr, "tool_search_tool_") {
+			marker := &BedrockAnthropicToolSearch{Type: typeStr}
+			if name, ok := toolMap["name"].(string); ok {
+				marker.Name = name
+			}
+			bedrockTools = append(bedrockTools, BedrockTool{AnthropicToolSearch: marker})
 			continue
 		}
 
@@ -1036,6 +1045,9 @@ func (r *BedrockInvokeRequest) convertAnthropicTools() *BedrockToolConfig {
 			inputSchemaBytes, _ := providerUtils.MarshalSorted(inputSchema)
 			spec.InputSchema = BedrockToolInputSchema{JSON: json.RawMessage(inputSchemaBytes)}
 		}
+		if deferLoading, ok := toolMap["defer_loading"].(bool); ok {
+			spec.DeferLoading = new(deferLoading)
+		}
 
 		bedrockTools = append(bedrockTools, BedrockTool{ToolSpec: spec})
 
@@ -1044,7 +1056,12 @@ func (r *BedrockInvokeRequest) convertAnthropicTools() *BedrockToolConfig {
 		// (BedrockConverseRequest.ToBifrostResponsesRequest) already knows how to read this —
 		// see responses.go's tool.CachePoint handling — including the Nova-family exclusion,
 		// so no extra gating is needed here.
-		if cacheControl, ok := toolMap["cache_control"].(map[string]interface{}); ok {
+		//
+		// A deferred tool is the exception: "A tool with defer_loading: true can't
+		// also carry cache_control: the API returns a 400." Honour the combination
+		// the client sent rather than manufacturing a breakpoint that guarantees one.
+		if cacheControl, ok := toolMap["cache_control"].(map[string]interface{}); ok &&
+			(spec.DeferLoading == nil || !*spec.DeferLoading) {
 			bedrockTools = append(bedrockTools, BedrockTool{CachePoint: newBedrockCachePoint(cacheControlTTL(cacheControl))})
 		}
 	}

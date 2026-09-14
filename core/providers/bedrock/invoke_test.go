@@ -80,9 +80,16 @@ func TestConvertAnthropicTools_ToolSearchTypeNeverBecomesInvocable(t *testing.T)
 
 	toolConfig := req.convertAnthropicTools()
 	require.NotNil(t, toolConfig)
-	require.Len(t, toolConfig.Tools, 1, "the tool_search_tool_* entry must be skipped, only the real tool kept")
-	require.NotNil(t, toolConfig.Tools[0].ToolSpec)
-	assert.Equal(t, "keep_me", toolConfig.Tools[0].ToolSpec.Name)
+	require.Len(t, toolConfig.Tools, 2, "the tool_search_tool_* entry is carried as a marker, not dropped (#7155)")
+	// The invariant this test guards is unchanged: the entry must never become an
+	// invocable ToolSpec. It is now carried on an ingress-only marker instead of
+	// being discarded, so the egress predicate can route the request to InvokeModel.
+	require.Nil(t, toolConfig.Tools[0].ToolSpec, "tool_search must never become an invocable tool")
+	require.NotNil(t, toolConfig.Tools[0].AnthropicToolSearch)
+	assert.Equal(t, "tool_search_tool_regex_20251119", toolConfig.Tools[0].AnthropicToolSearch.Type)
+	assert.Equal(t, "tool_search_tool_regex", toolConfig.Tools[0].AnthropicToolSearch.Name)
+	require.NotNil(t, toolConfig.Tools[1].ToolSpec)
+	assert.Equal(t, "keep_me", toolConfig.Tools[1].ToolSpec.Name)
 }
 
 // TestConvertAnthropicTools_CarriesCacheControl is the regression test for #5629: a
@@ -1448,4 +1455,42 @@ func TestToBedrockConverseRequest_InvokeToolSearchEndToEnd(t *testing.T) {
 
 	assert.True(t, responsesUsesAnthropicInvokePath(ctx, responsesReq),
 		"a tool-search request on the invoke ingress must route to InvokeModel, not Converse")
+}
+
+// TestConvertAnthropicTools_DeferredToolSkipsCachePoint pins the one tool-level
+// combination Anthropic rejects outright: "A tool with defer_loading: true can't
+// also carry cache_control: the API returns a 400."
+// (https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-search-tool)
+// The invoke ingress converts cache_control into a positional cachePoint sibling
+// (#5629), so it must not manufacture one for a deferred tool. A non-deferred
+// neighbour in the same request still gets its breakpoint.
+func TestConvertAnthropicTools_DeferredToolSkipsCachePoint(t *testing.T) {
+	deferredCached := anthropicToolMap("deferred", map[string]interface{}{"type": "ephemeral"})
+	deferredCached["defer_loading"] = true
+
+	req := &BedrockInvokeRequest{
+		Tools: []interface{}{
+			deferredCached,
+			anthropicToolMap("eager", map[string]interface{}{"type": "ephemeral"}),
+		},
+	}
+
+	toolConfig := req.convertAnthropicTools()
+	require.NotNil(t, toolConfig)
+
+	// deferred tool, then eager tool, then the eager tool's cachePoint — three entries.
+	require.Len(t, toolConfig.Tools, 3, "only the non-deferred tool may get a cachePoint: %+v", toolConfig.Tools)
+
+	require.NotNil(t, toolConfig.Tools[0].ToolSpec)
+	assert.Equal(t, "deferred", toolConfig.Tools[0].ToolSpec.Name)
+	require.NotNil(t, toolConfig.Tools[0].ToolSpec.DeferLoading)
+	assert.True(t, *toolConfig.Tools[0].ToolSpec.DeferLoading)
+	assert.Nil(t, toolConfig.Tools[0].CachePoint)
+
+	require.NotNil(t, toolConfig.Tools[1].ToolSpec)
+	assert.Equal(t, "eager", toolConfig.Tools[1].ToolSpec.Name)
+	assert.Nil(t, toolConfig.Tools[1].ToolSpec.DeferLoading)
+
+	require.NotNil(t, toolConfig.Tools[2].CachePoint, "the non-deferred tool keeps its cache breakpoint")
+	assert.Nil(t, toolConfig.Tools[2].ToolSpec)
 }
