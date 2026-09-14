@@ -243,6 +243,26 @@ type BedrockContentBlock struct {
 
 	// Citations from nova_grounding — co-located with a text block in the same content block
 	CitationsContent *BedrockCitationsContent `json:"citationsContent,omitempty"`
+
+	// Replayed Anthropic tool-search blocks. A client must echo the assistant's
+	// server_tool_use and tool_search_tool_result back unchanged on the next turn,
+	// but Converse has no wire slot for either — so they ride across the invoke
+	// ingress on these json:"-" carriers (#7155).
+	AnthropicToolSearchUse    *BedrockAnthropicToolSearchUse    `json:"-"`
+	AnthropicToolSearchResult *BedrockAnthropicToolSearchResult `json:"-"`
+}
+
+// BedrockAnthropicToolSearchUse is a replayed server_tool_use naming a tool-search variant.
+type BedrockAnthropicToolSearchUse struct {
+	ID   string
+	Name string
+}
+
+// BedrockAnthropicToolSearchResult is a replayed tool_search_tool_result: the id of the
+// server_tool_use it answers, plus the names of the tools that search discovered.
+type BedrockAnthropicToolSearchResult struct {
+	ToolUseID      string
+	ToolReferences []string
 }
 
 type BedrockCachePointType string
