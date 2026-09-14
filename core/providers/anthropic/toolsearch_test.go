@@ -357,8 +357,8 @@ const toolSearchWireResultBlock = `{
 // TestToolSearch_WireShapeCarriesToolReferences decodes the documented wire shape
 // and asserts the discovered tool names are recoverable from the decoded block.
 // AnthropicContentBlock.ToolReferences is declared flat (`json:"tool_references"`),
-// so real traffic leaves it nil and the references survive only one level down in
-// Content. Every reader in the provider reads the flat field.
+// so real traffic leaves it nil and the references land one level down in Content —
+// DiscoveredToolReferences is the reader that spans both shapes.
 func TestToolSearch_WireShapeCarriesToolReferences(t *testing.T) {
 	t.Parallel()
 
@@ -369,16 +369,39 @@ func TestToolSearch_WireShapeCarriesToolReferences(t *testing.T) {
 	if block.Type != AnthropicContentBlockTypeToolSearchToolResult {
 		t.Fatalf("block type = %q, want tool_search_tool_result", block.Type)
 	}
+	if len(block.ToolReferences) != 0 {
+		t.Errorf("the flat field is not the wire shape; expected it to stay empty, got %d refs", len(block.ToolReferences))
+	}
 
 	names := make([]string, 0, 1)
-	for _, ref := range block.ToolReferences {
+	for _, ref := range block.DiscoveredToolReferences() {
 		if ref.ToolName != nil {
 			names = append(names, *ref.ToolName)
 		}
 	}
 	if len(names) != 1 || names[0] != tsDiscoveredTool {
-		t.Fatalf("block.ToolReferences = %v, want [%q] — nested tool_references were not hoisted onto the block",
+		t.Fatalf("DiscoveredToolReferences() = %v, want [%q] — nested tool_references were not reachable",
 			names, tsDiscoveredTool)
+	}
+}
+
+// TestToolSearch_FlatToolReferencesStillRead pins the other half of the accessor's
+// contract: Bifrost's own rebuild (convertBifrostToolSearchCallToAnthropicBlocks)
+// sets the flat field, so a block in that shape must keep working.
+func TestToolSearch_FlatToolReferencesStillRead(t *testing.T) {
+	t.Parallel()
+
+	block := AnthropicContentBlock{
+		Type:      AnthropicContentBlockTypeToolSearchToolResult,
+		ToolUseID: schemas.Ptr(tsServerToolUseID),
+		ToolReferences: []AnthropicContentBlock{
+			{Type: AnthropicContentBlockTypeToolReference, ToolName: schemas.Ptr(tsDiscoveredTool)},
+		},
+	}
+
+	refs := block.DiscoveredToolReferences()
+	if len(refs) != 1 || refs[0].ToolName == nil || *refs[0].ToolName != tsDiscoveredTool {
+		t.Fatalf("DiscoveredToolReferences() = %+v, want one ref to %q", refs, tsDiscoveredTool)
 	}
 }
 
@@ -453,5 +476,78 @@ func TestToolSearch_NonStreamingForwardsToolReferences(t *testing.T) {
 	}
 	if !sawDiscoveredCall {
 		t.Errorf("the follow-up tool_use calling the discovered tool must still be forwarded as a function_call")
+	}
+}
+
+// TestToolSearch_GroupedReplayKeepsToolSearchCall covers the replay direction used
+// for Bedrock (ConvertAnthropicMessagesToBifrostMessages is called with
+// keepToolsGrouped = provider == schemas.Bedrock). A client echoing the assistant
+// turn back — which Anthropic requires, unchanged — must not have the tool-search
+// server_tool_use downgraded into a function_call: that would make the caller
+// return a tool_result for a srvtoolu_ id, which the API rejects.
+func TestToolSearch_GroupedReplayKeepsToolSearchCall(t *testing.T) {
+	t.Parallel()
+
+	var resultBlock AnthropicContentBlock
+	if err := sonic.Unmarshal([]byte(toolSearchWireResultBlock), &resultBlock); err != nil {
+		t.Fatalf("documented wire block must decode: %v", err)
+	}
+
+	assistant := AnthropicMessage{
+		Role: AnthropicMessageRoleAssistant,
+		Content: AnthropicContent{
+			ContentBlocks: []AnthropicContentBlock{
+				{
+					Type: AnthropicContentBlockTypeServerToolUse,
+					ID:   schemas.Ptr(tsServerToolUseID),
+					Name: schemas.Ptr(string(AnthropicToolNameToolSearchRegex)),
+				},
+				resultBlock,
+				{
+					Type: AnthropicContentBlockTypeToolUse,
+					ID:   schemas.Ptr(tsDiscoveredCallID),
+					Name: schemas.Ptr(tsDiscoveredTool),
+				},
+			},
+		},
+	}
+
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	msgs := ConvertAnthropicMessagesToBifrostMessages(ctx, []AnthropicMessage{assistant}, nil, false, true)
+
+	var search *schemas.ResponsesMessage
+	var sawDiscoveredCall bool
+	for i := range msgs {
+		m := &msgs[i]
+		if m.Type == nil {
+			continue
+		}
+		switch *m.Type {
+		case schemas.ResponsesMessageTypeToolSearchCall:
+			search = m
+		case schemas.ResponsesMessageTypeFunctionCall:
+			if m.ResponsesToolMessage != nil && m.ResponsesToolMessage.Name != nil {
+				switch *m.ResponsesToolMessage.Name {
+				case tsDiscoveredTool:
+					sawDiscoveredCall = true
+				case string(AnthropicToolNameToolSearchRegex), string(AnthropicToolNameToolSearchBM25):
+					t.Errorf("tool-search server_tool_use was replayed as a client function_call")
+				}
+			}
+		}
+	}
+
+	if search == nil {
+		t.Fatal("no tool_search_call survived the grouped replay conversion")
+	}
+	if search.ResponsesToolMessage == nil || search.ResponsesToolMessage.ResponsesToolSearchCall == nil {
+		t.Fatal("replayed tool_search_call carries no ResponsesToolSearchCall payload")
+	}
+	refs := search.ResponsesToolMessage.ResponsesToolSearchCall.ToolReferences
+	if len(refs) != 1 || refs[0] != tsDiscoveredTool {
+		t.Fatalf("replayed tool_references = %v, want [%q]", refs, tsDiscoveredTool)
+	}
+	if !sawDiscoveredCall {
+		t.Errorf("the tool_use calling the discovered tool must still replay as a function_call")
 	}
 }

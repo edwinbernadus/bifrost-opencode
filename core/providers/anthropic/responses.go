@@ -1100,8 +1100,7 @@ func (chunk *AnthropicStreamEvent) ToBifrostResponsesStream(ctx context.Context,
 			// emits a normal tool_use to call one. Mirrors the web_search query path.
 			if chunk.ContentBlock.Type == AnthropicContentBlockTypeServerToolUse &&
 				chunk.ContentBlock.Name != nil &&
-				(*chunk.ContentBlock.Name == string(AnthropicToolNameToolSearchRegex) ||
-					*chunk.ContentBlock.Name == string(AnthropicToolNameToolSearchBM25)) &&
+				isAnthropicToolSearchToolName(*chunk.ContentBlock.Name) &&
 				chunk.ContentBlock.ID != nil {
 
 				state.SeenRealToolCall = true
@@ -2232,7 +2231,7 @@ func (chunk *AnthropicStreamEvent) ToBifrostResponsesStream(ctx context.Context,
 			// of those tools) is forwarded by the generic tool_use path.
 			if state.ToolSearchResult != nil && state.ToolSearchToolID != nil {
 				var toolRefs []string
-				for _, ref := range state.ToolSearchResult.ToolReferences {
+				for _, ref := range state.ToolSearchResult.DiscoveredToolReferences() {
 					if ref.ToolName != nil {
 						toolRefs = append(toolRefs, *ref.ToolName)
 					} else if ref.Name != nil {
@@ -6244,10 +6243,34 @@ func convertAnthropicContentBlocksToResponsesMessagesGrouped(contentBlocks []Ant
 			}
 
 		case AnthropicContentBlockTypeServerToolUse:
+			// A tool-search server_tool_use is not a client tool call. Accumulating it
+			// turns it into a function_call on replay, which makes the caller return a
+			// tool_result for a srvtoolu_ id — Anthropic rejects that outright.
+			if block.ID != nil && block.Name != nil && isAnthropicToolSearchToolName(*block.Name) {
+				// The run-flush switch above keeps every server_tool_use inside the
+				// tool_use run, so flush it here to keep wire order against this item.
+				flushPendingToolUses()
+				bifrostMessages = append(bifrostMessages, schemas.ResponsesMessage{
+					ID:     block.ID,
+					Type:   schemas.Ptr(schemas.ResponsesMessageTypeToolSearchCall),
+					Status: schemas.Ptr("completed"),
+					ResponsesToolMessage: &schemas.ResponsesToolMessage{
+						CallID: block.ID,
+						Name:   block.Name,
+					},
+				})
+				break
+			}
 			// Accumulate server tool use blocks
 			if block.ID != nil && block.Name != nil {
 				blockCopy := block
 				pendingToolUseBlocks = append(pendingToolUseBlocks, &blockCopy)
+			}
+
+		case AnthropicContentBlockTypeToolSearchToolResult:
+			// Fold the discovered tool references onto the matching tool_search_call.
+			if block.ToolUseID != nil {
+				attachToolSearchReferencesToCall(bifrostMessages, *block.ToolUseID, block)
 			}
 
 		case AnthropicContentBlockTypeMCPToolUse:
@@ -6725,6 +6748,26 @@ func convertAnthropicContentBlocksToResponsesMessages(ctx *schemas.BifrostContex
 				if isOutputMessage {
 					bifrostMessages = append(bifrostMessages, buildBifrostCodeExecutionCall(block))
 				}
+			} else if block.Name != nil && isAnthropicToolSearchToolName(*block.Name) {
+				// Server-side tool search. The discovered tool_references arrive in the
+				// paired tool_search_tool_result block below; emit the call item here so
+				// that block has something to attach to, matching the shape the streaming
+				// path emits as its output_item.added / .done pair.
+				//
+				// Unlike the web_search sibling above this is emitted for request messages
+				// too, not just output: Anthropic requires the server_tool_use and
+				// tool_search_tool_result blocks to be echoed back unchanged on the next
+				// turn, so replay depends on the pair round-tripping through the neutral
+				// layer rather than being output-only.
+				bifrostMessages = append(bifrostMessages, schemas.ResponsesMessage{
+					ID:     block.ID,
+					Type:   schemas.Ptr(schemas.ResponsesMessageTypeToolSearchCall),
+					Status: schemas.Ptr("completed"),
+					ResponsesToolMessage: &schemas.ResponsesToolMessage{
+						CallID: block.ID,
+						Name:   block.Name,
+					},
+				})
 			}
 
 		case AnthropicContentBlockTypeCodeExecutionToolResult,
@@ -6772,6 +6815,12 @@ func convertAnthropicContentBlocksToResponsesMessages(ctx *schemas.BifrostContex
 			// Find the corresponding web_search_call by tool_use_id
 			if block.ToolUseID != nil {
 				attachWebSearchSourcesToCall(bifrostMessages, *block.ToolUseID, block, true)
+			}
+
+		case AnthropicContentBlockTypeToolSearchToolResult:
+			// Fold the discovered tool references onto the matching tool_search_call.
+			if block.ToolUseID != nil {
+				attachToolSearchReferencesToCall(bifrostMessages, *block.ToolUseID, block)
 			}
 
 		case AnthropicContentBlockTypeWebFetchToolResult:
@@ -7687,6 +7736,19 @@ func convertBifrostToolSearchCallToAnthropicBlocks(msg *schemas.ResponsesMessage
 // isAnthropicCodeExecutionToolName reports whether name is one of the code
 // execution sub-tools (code_execution_20250825+ surfaces bash + text_editor;
 // code_execution is the legacy Python sub-tool).
+// isAnthropicToolSearchToolName reports whether a server_tool_use block names one
+// of the two tool-search variants. Regex and bm25 are not interchangeable (Python
+// re.search patterns vs. natural language), but both are server-side searches and
+// both produce a tool_search_tool_result.
+func isAnthropicToolSearchToolName(name string) bool {
+	switch AnthropicToolName(name) {
+	case AnthropicToolNameToolSearchRegex, AnthropicToolNameToolSearchBM25:
+		return true
+	default:
+		return false
+	}
+}
+
 func isAnthropicCodeExecutionToolName(name string) bool {
 	switch AnthropicToolName(name) {
 	case AnthropicToolNameCodeExecution, AnthropicToolNameBashCodeExecution, AnthropicToolNameTextEditorCodeExecution:
