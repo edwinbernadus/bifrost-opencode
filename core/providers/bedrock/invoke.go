@@ -1649,8 +1649,24 @@ func toAnthropicInvokeStreamBytes(resp *schemas.BifrostResponsesStreamResponse) 
 			if resp.ContentIndex != nil {
 				idx = *resp.ContentIndex
 			}
+			// A tool_search_call is Anthropic's server-side search, not a client tool
+			// call. Emitting it as tool_use makes the caller execute a srvtoolu_ id and
+			// return a tool_result for it, which the API rejects on the next turn:
+			// "Never return a tool_result for its srvtoolu_... ID."
+			// (https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-search-tool)
+			//
+			// The paired tool_search_tool_result block is deliberately NOT re-emitted
+			// here. The neutral stream collapses Anthropic's two blocks into a single
+			// tool_search_call item, and output_item.done carries the result block's
+			// content index rather than the server_tool_use's — so re-expanding the pair
+			// needs per-stream index state this stateless per-chunk converter does not
+			// have. Tracked separately; the non-streaming path emits the full pair.
+			blockType := "tool_use"
+			if resp.Item.Type != nil && *resp.Item.Type == schemas.ResponsesMessageTypeToolSearchCall {
+				blockType = "server_tool_use"
+			}
 			block := map[string]interface{}{
-				"type":  "tool_use",
+				"type":  blockType,
 				"id":    "",
 				"name":  "",
 				"input": map[string]interface{}{},

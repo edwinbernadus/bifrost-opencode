@@ -1570,3 +1570,52 @@ func TestToBedrockInvokeMessagesResponse_ToolSearchCall(t *testing.T) {
 		}
 	}
 }
+
+// TestToBedrockInvokeMessagesStreamResponse_ToolSearchNotToolUse is the streaming
+// twin of TestToBedrockInvokeMessagesResponse_ToolSearchCall. output_item.added for
+// a tool_search_call must open a server_tool_use block, not a tool_use: a caller that
+// sees tool_use executes the srvtoolu_ id and returns a tool_result for it, which
+// Anthropic rejects on the next turn.
+// (https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-search-tool)
+func TestToBedrockInvokeMessagesStreamResponse_ToolSearchNotToolUse(t *testing.T) {
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	const searchID = "srvtoolu_01ABC"
+
+	added := func(itemType schemas.ResponsesMessageType, id, name string) *schemas.BifrostResponsesStreamResponse {
+		return &schemas.BifrostResponsesStreamResponse{
+			Type:         schemas.ResponsesStreamResponseTypeOutputItemAdded,
+			ContentIndex: schemas.Ptr(0),
+			Item: &schemas.ResponsesMessage{
+				ID:   schemas.Ptr(id),
+				Type: schemas.Ptr(itemType),
+				ResponsesToolMessage: &schemas.ResponsesToolMessage{
+					CallID: schemas.Ptr(id),
+					Name:   schemas.Ptr(name),
+				},
+			},
+			ExtraFields: schemas.BifrostResponseExtraFields{ResolvedModelUsed: "us.anthropic.claude-sonnet-4-6-v1:0"},
+		}
+	}
+
+	t.Run("tool_search_call opens server_tool_use", func(t *testing.T) {
+		_, event, err := ToBedrockInvokeMessagesStreamResponse(ctx, added(schemas.ResponsesMessageTypeToolSearchCall, searchID, "tool_search_tool_regex"))
+		require.NoError(t, err)
+		bedrockEvent, ok := event.(*BedrockStreamEvent)
+		require.True(t, ok, "expected a BedrockStreamEvent, got %T", event)
+		require.Len(t, bedrockEvent.InvokeModelRawChunks, 1)
+		raw := bedrockEvent.InvokeModelRawChunks[0]
+
+		assert.Equal(t, "server_tool_use", gjson.GetBytes(raw, "content_block.type").String(),
+			"the srvtoolu_ block must never open as a client tool_use: %s", string(raw))
+		assert.Equal(t, searchID, gjson.GetBytes(raw, "content_block.id").String())
+	})
+
+	t.Run("ordinary function_call still opens tool_use", func(t *testing.T) {
+		_, event, err := ToBedrockInvokeMessagesStreamResponse(ctx, added(schemas.ResponsesMessageTypeFunctionCall, "toolu_01XYZ", "get_weather"))
+		require.NoError(t, err)
+		bedrockEvent, ok := event.(*BedrockStreamEvent)
+		require.True(t, ok)
+		require.Len(t, bedrockEvent.InvokeModelRawChunks, 1)
+		assert.Equal(t, "tool_use", gjson.GetBytes(bedrockEvent.InvokeModelRawChunks[0], "content_block.type").String())
+	})
+}
