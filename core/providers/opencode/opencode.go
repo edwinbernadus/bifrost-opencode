@@ -27,18 +27,22 @@ type opencodeProvider struct {
 	// Completions when the upstream gateway does not implement /v1/responses.
 	// Zen is the only such gateway today; Go serves /v1/responses natively.
 	fallbackResponsesToChat bool
+	// synthesizeCLIHeaders adds OpenCode CLI identity headers (User-Agent,
+	// x-opencode-client/project/request/session) to every request. Only Zen's
+	// free tier is known to need this — see cliheaders.go.
+	synthesizeCLIHeaders bool
 }
 
 // NewOpencodeZenProvider creates a new Opencode Zen provider instance.
 // Zen is the pay-as-you-go gateway at https://opencode.ai/zen/v1.
 func NewOpencodeZenProvider(config *schemas.ProviderConfig, logger schemas.Logger) (*opencodeProvider, error) {
-	return newOpencodeProvider(config, schemas.OpencodeZen, "https://opencode.ai/zen", logger, true)
+	return newOpencodeProvider(config, schemas.OpencodeZen, "https://opencode.ai/zen", logger, true, true)
 }
 
 // NewOpencodeGoProvider creates a new Opencode Go provider instance.
 // Go is the subscription-based gateway at https://opencode.ai/zen/go/v1.
 func NewOpencodeGoProvider(config *schemas.ProviderConfig, logger schemas.Logger) (*opencodeProvider, error) {
-	return newOpencodeProvider(config, schemas.OpencodeGo, "https://opencode.ai/zen/go", logger, false)
+	return newOpencodeProvider(config, schemas.OpencodeGo, "https://opencode.ai/zen/go", logger, false, false)
 }
 
 // newOpencodeProvider initializes the shared provider infrastructure.
@@ -48,6 +52,7 @@ func newOpencodeProvider(
 	defaultBaseURL string,
 	logger schemas.Logger,
 	fallbackResponsesToChat bool,
+	synthesizeCLIHeaders bool,
 ) (*opencodeProvider, error) {
 	config.CheckAndSetDefaults()
 
@@ -81,7 +86,17 @@ func newOpencodeProvider(
 		sendBackRawRequest:      config.SendBackRawRequest,
 		sendBackRawResponse:     config.SendBackRawResponse,
 		fallbackResponsesToChat: fallbackResponsesToChat,
+		synthesizeCLIHeaders:    synthesizeCLIHeaders,
 	}, nil
+}
+
+// requestHeaders returns the extra headers to send with a request, adding OpenCode
+// CLI identity headers when this provider instance is configured to (Zen only).
+func (p *opencodeProvider) requestHeaders() map[string]string {
+	if p.synthesizeCLIHeaders {
+		return buildCLIHeaders(p.networkConfig.ExtraHeaders)
+	}
+	return p.networkConfig.ExtraHeaders
 }
 
 // GetProviderKey returns the provider identifier stored at construction time.
@@ -122,7 +137,7 @@ func (p *opencodeProvider) ChatCompletion(ctx *schemas.BifrostContext, key schem
 		p.networkConfig.BaseURL+providerUtils.GetPathFromContext(ctx, "/v1/chat/completions"),
 		request,
 		openai.BearerAuthHeader(key),
-		p.networkConfig.ExtraHeaders,
+		p.requestHeaders(),
 		providerUtils.ShouldSendBackRawRequest(ctx, p.sendBackRawRequest),
 		providerUtils.ShouldSendBackRawResponse(ctx, p.sendBackRawResponse),
 		p.GetProviderKey(),
@@ -141,7 +156,7 @@ func (p *opencodeProvider) ChatCompletionStream(ctx *schemas.BifrostContext, pos
 		p.networkConfig.BaseURL+providerUtils.GetPathFromContext(ctx, "/v1/chat/completions"),
 		request,
 		openai.BearerAuthHeader(key),
-		p.networkConfig.ExtraHeaders,
+		p.requestHeaders(),
 		p.networkConfig.StreamIdleTimeoutInSeconds,
 		providerUtils.ShouldSendBackRawRequest(ctx, p.sendBackRawRequest),
 		providerUtils.ShouldSendBackRawResponse(ctx, p.sendBackRawResponse),
@@ -174,7 +189,7 @@ func (p *opencodeProvider) Responses(ctx *schemas.BifrostContext, key schemas.Ke
 		p.networkConfig.BaseURL+providerUtils.GetPathFromContext(ctx, "/v1/responses"),
 		request,
 		openai.BearerAuthHeader(key),
-		p.networkConfig.ExtraHeaders,
+		p.requestHeaders(),
 		providerUtils.ShouldSendBackRawRequest(ctx, p.sendBackRawRequest),
 		providerUtils.ShouldSendBackRawResponse(ctx, p.sendBackRawResponse),
 		p.providerKey,
@@ -204,7 +219,7 @@ func (p *opencodeProvider) ResponsesStream(ctx *schemas.BifrostContext, postHook
 		p.networkConfig.BaseURL+providerUtils.GetPathFromContext(ctx, "/v1/responses"),
 		request,
 		openai.BearerAuthHeader(key),
-		p.networkConfig.ExtraHeaders,
+		p.requestHeaders(),
 		p.networkConfig.StreamIdleTimeoutInSeconds,
 		providerUtils.ShouldSendBackRawRequest(ctx, p.sendBackRawRequest),
 		providerUtils.ShouldSendBackRawResponse(ctx, p.sendBackRawResponse),
