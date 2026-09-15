@@ -337,3 +337,9 @@ For context window sizes and model capability metadata, point `pricing_url` and 
 **Behavior**: Prompt caching support depends on the underlying provider serving the model. Some models report `cached_tokens` in usage; others (e.g., DeepSeek V4 Flash on Go) may not cache at all.
 **Impact**: Cache-aware pricing only applies when cache tokens are reported. Verify model-specific cache behavior if you depend on cache cost savings.
 </Accordion>
+
+<Accordion title="Zen Requests From Datacenter IPs Need CLI Identity Headers">
+**Severity**: Low
+**Behavior**: OpenCode Zen's edge rejects chat completion requests that don't look like they came from the OpenCode CLI — a generic User-Agent from a datacenter/VPS IP (which is what every Bifrost deployment presents) can be rejected, and some free-tier models reject requests missing an `x-opencode-session` header.
+**Resolution**: The `opencode-zen` provider automatically adds `User-Agent`, `x-opencode-client`, `x-opencode-project`, `x-opencode-request`, and `x-opencode-session` headers to every request, matching the OpenCode CLI's own request shape. Override the configurable values with the `OPENCODE_USER_AGENT`, `OPENCODE_CLIENT`, and `OPENCODE_PROJECT` environment variables, or via `network_config.extra_headers` on the provider. Disable this behavior entirely with `OPENCODE_SYNTHESIZE_CLI_HEADERS=false` if it ever becomes unnecessary or counterproductive. `opencode-go` does not need this and is unaffected.
+</Accordion>
