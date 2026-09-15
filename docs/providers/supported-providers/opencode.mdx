@@ -340,6 +340,33 @@ For context window sizes and model capability metadata, point `pricing_url` and 
 
 <Accordion title="Zen Requests From Datacenter IPs Need CLI Identity Headers">
 **Severity**: Low
-**Behavior**: OpenCode Zen's edge rejects chat completion requests that don't look like they came from the OpenCode CLI — a generic User-Agent from a datacenter/VPS IP (which is what every Bifrost deployment presents) can be rejected, and some free-tier models reject requests missing an `x-opencode-session` header.
+**Behavior**: OpenCode Zen's edge rejects chat completion requests that don't look like they came from the OpenCode CLI — a generic User-Agent from a datacenter/VPS IP (which is what every Bifrost deployment presents) gets `400 MissingSessionID: "OpenCode's free tier can only be used in OpenCode"`, even with a valid API key. Verified directly against `https://opencode.ai/zen/v1/chat/completions`: the block is purely by request shape, not IP reputation or auth — a request carrying the right headers succeeds with **no Authorization header at all**, and the header *values* don't need to be fresh per request (reusing the same hardcoded UUIDs across repeated calls still succeeds — Cloudflare checks presence/shape, not a real session handshake).
 **Resolution**: The `opencode-zen` provider automatically adds `User-Agent`, `x-opencode-client`, `x-opencode-project`, `x-opencode-request`, and `x-opencode-session` headers to every request, matching the OpenCode CLI's own request shape. Override the configurable values with the `OPENCODE_USER_AGENT`, `OPENCODE_CLIENT`, and `OPENCODE_PROJECT` environment variables, or via `network_config.extra_headers` on the provider. Disable this behavior entirely with `OPENCODE_SYNTHESIZE_CLI_HEADERS=false` if it ever becomes unnecessary or counterproductive. `opencode-go` does not need this and is unaffected.
+
+**Running a Bifrost version without this fix?** Get the same result today with a custom provider instead of the native `opencode-zen` one, since a custom provider supports `is_key_less` (skips sending any Authorization header — sending even a placeholder Bearer token gets a different rejection, `401 AuthError: Invalid API key`, instead of succeeding):
+```bash
+curl -X POST http://localhost:8090/api/providers -d '{
+  "provider": "opencode-free",
+  "network_config": {"base_url": "https://opencode.ai/zen"},
+  "custom_provider_config": {"base_provider_type": "openai", "is_key_less": true}
+}'
+
+curl -X PUT http://localhost:8090/api/providers/opencode-free -d '{
+  "network_config": {
+    "base_url": "https://opencode.ai/zen",
+    "extra_headers": {
+      "User-Agent": "opencode",
+      "x-opencode-client": "desktop",
+      "x-opencode-project": "global",
+      "x-opencode-request": "11111111-1111-1111-1111-111111111111",
+      "x-opencode-session": "22222222-2222-2222-2222-222222222222"
+    }
+  },
+  "custom_provider_config": {"base_provider_type": "openai", "is_key_less": true},
+  "concurrency_and_buffer_size": {"concurrency": 1000, "buffer_size": 5000}
+}'
+```
+`PUT` on a custom provider must resend `custom_provider_config` in full every time — omitting it is treated as "remove it", which then fails the *next* update with `custom_provider_config cannot be removed after creation`. You'll still need one placeholder key (`POST /api/providers/opencode-free/keys` with any dummy value and `models: ["*"]`) even with `is_key_less: true` — Bifrost refuses to route to a provider with zero registered keys regardless of that flag; the flag only controls whether the key's value is sent as `Authorization`.
+
+Note the native `opencode-zen`/`opencode-go` provider types don't expose `is_key_less` at all — even after this fix, a real key from [opencode.ai/auth](https://opencode.ai/auth) (or a placeholder, for the free tier) is required to use them directly.
 </Accordion>
